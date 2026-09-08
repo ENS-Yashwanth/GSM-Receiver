@@ -1,0 +1,47 @@
+------- ******* -------
+LINKS TO INSTALL THE REQUIRED SOFTWARE TOOLS
+------- ******* -------
+Link to install the CH341SER Driver on Windows - https://www.deshide.com/News-detail_WCH34xDriver.html
+Link to install the Python (Version 3.10.6) on Windows - https://www.python.org/downloads/
+Link to install the PuTTY SSH and telnet client on Windows - https://putty.org/index.html 
+Link to install the VSCode on Windows - https://code.visualstudio.com/download?_exp_download=d53503e735
+Link to install the Git on Windows - https://git-scm.com/install/windows?utm_source=chatgpt.com
+
+------- ******* -------
+STEPS TO INSTALL AND CHECK PYTHON
+------- ******* -------
+1. When the download for the executable is finished then click it
+2. On the first screen, you can customize where you want your Python installation to be installed. I choose the default. Click also the checkbox "Add Python <version> to PATH". This will add your python executable to the PATH variable.
+3. Setup will initialize. If user account control pops up then click Yes. Wait for the setup to finish.
+4. If everything goes well then the successful setup message is displayed.
+5. To test out your new Python installation, by checking the version command 
+	python --version
+
+------- ******* -------
+STEPS TO INSTALL AND CHECK CH340 / CH341 DRIVER
+------- ******* -------
+1. Once you have installed this driver then it should be appear in the COM and LPT section of your device manager
+
+------- ******* -------
+STEPS TO INSTALL PUTTY AND TEST SIM800C USB to GSM MODULE USING AT COMMANDS 
+------- ******* -------
+1. You can test your SIM800C USB to GSM module without using any programming language by using AT commands. 
+	AT commands, or Attention for short, are text commands that you can send directly to any module is configured to receive such commands.
+2. To send AT commands, set the connection type to Serial and the Serial Line to the COM port assignment of your Windows or PC.
+
+------- ******* -------
+STEPS TO SETUP THE GSM RECEIVER
+------- ******* -------
+1. To clone the repository and open the project in VSCode, you can execute the commands below on your command prompt
+	git clone https://github.com/donskytech/python_projects_snippets.git
+	cd python_projects_snippets/usb-to-gsm
+	code .
+2. Create a virtual environment for this project by executing the command below. This will create a folder call ".venv"
+	py -m venv .venv
+3. Activate the Python Virtual Environment by executing the code below
+	.venv\Scripts\activate.bat
+4. Next install the required libraries for this project on VSCode by executing the command below
+	pip install -r requireents.txt
+		You should see the following message when the "PySerial" library is installed. This is the library that we will be using to communicate with the SIM800C USB to GSM module using the Serial protocol.
+5. To run the code snippet then type the following in your terminal
+	py gsm_receiver.py
