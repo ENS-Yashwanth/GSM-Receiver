@@ -15,7 +15,7 @@ import serial.tools.list_ports
 # CONFIGURATION
 # ============================================================
 
-SERIAL_PORT = "COM9"
+SERIAL_PORT = None  # Automatically detected; do not hard-code COM9.
 
 # The RS2248/SIM800C USB stick normally works at 9600 baud.
 BAUD_RATES = [9600, 115200, 57600, 38400, 19200]
@@ -41,6 +41,8 @@ ser = None
 current_baud = None
 
 serial_lock = threading.Lock()
+# Prevent dashboard/command threads from competing with the serial reader.
+command_lock = threading.RLock()
 state_lock = threading.Lock()
 stop_event = threading.Event()
 
@@ -50,13 +52,17 @@ state = {
     "ring_count": 0,
     "connected_at": None,
     "last_event": "Starting receiver...",
-    "audio": "NOT AVAILABLE VIA COM9",
+    "audio": "NOT AVAILABLE VIA SERIAL PORT",
     "audio_available": False,
     "muted": False,
+    "last_sms_sender": "",
+    "last_sms_message": "",
+    "last_sms_time": "",
+    "pending_call": False,
 }
 
 last_answer_time = 0.0
-ANSWER_COOLDOWN_SEC = 3.0
+ANSWER_COOLDOWN_SEC = 0.0  # No ring suppression; failed calls must be retried.
 
 
 # ============================================================
@@ -157,47 +163,64 @@ def read_lines(seconds=1.0):
 
 
 def send_command(command, expected="OK", timeout=3.0):
-    if not send_raw(command):
-        return False
-
-    expected_list = [expected] if isinstance(expected, str) else expected
-    end_time = time.time() + timeout
-    buffer = ""
-
-    while time.time() < end_time:
-        try:
-            with serial_lock:
-                waiting = ser.in_waiting
-                data = ser.read(waiting) if waiting else b""
-
-            if not data:
-                time.sleep(0.01)
-                continue
-
-            buffer += data.decode("utf-8", errors="replace")
-
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                log(f"GSM> {line}")
-                upper = line.upper()
-
-                for item in expected_list:
-                    if item.upper() in upper:
-                        return True
-
-                if upper in ("ERROR", "NO CARRIER", "BUSY"):
-                    return False
-
-        except Exception as exc:
-            log(f"COMMAND READ ERROR: {exc}")
+    """Send a command while preventing another thread from reading its response."""
+    with command_lock:
+        if not send_raw(command):
             return False
 
-    return False
+        expected_list = [expected] if isinstance(expected, str) else expected
+        deadline = time.time() + timeout
+        buffer = ""
+
+        while time.time() < deadline:
+            try:
+                with serial_lock:
+                    waiting = ser.in_waiting if ser else 0
+                    data = ser.read(waiting) if waiting else b""
+
+                if not data:
+                    time.sleep(0.01)
+                    continue
+
+                buffer += data.decode("utf-8", errors="replace")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    log(f"GSM> {line}")
+                    upper = line.upper()
+
+                    # Unsolicited call/SMS indications can arrive while a command is active.
+                    # Do not treat them as command failures.
+                    if upper.startswith("+CMTI:"):
+                        handle_sms_notification(line)
+                        continue
+
+                    if upper.startswith("+CRING:") or upper == "RING":
+                        set_state(status="INCOMING", last_event="Incoming voice call detected.")
+                        continue
+
+                    if upper.startswith("+CLIP:"):
+                        number = extract_caller_number(line)
+                        if number:
+                            set_state(caller=number, last_event=f"Caller ID received: {number}")
+                        continue
+
+                    if any(item.upper() in upper for item in expected_list):
+                        return True
+
+                    if upper in ("ERROR", "BUSY"):
+                        return False
+
+                # Keep a partial line for the next read.
+            except Exception as exc:
+                log(f"COMMAND READ ERROR: {exc}")
+                return False
+
+        return False
 
 
 # ============================================================
@@ -216,10 +239,11 @@ def list_com_ports():
         log(f"  {port.device} - {port.description}")
 
 
-def test_modem(baud):
-    global ser, current_baud
+def test_modem(port, baud):
+    """Try one serial port at one baud rate and verify it responds to AT."""
+    global ser, current_baud, SERIAL_PORT
 
-    log(f"Testing {SERIAL_PORT} at {baud} baud...")
+    log(f"Testing {port} at {baud} baud...")
 
     try:
         if ser is not None:
@@ -227,9 +251,10 @@ def test_modem(baud):
                 ser.close()
             except Exception:
                 pass
+            ser = None
 
         ser = serial.Serial(
-            port=SERIAL_PORT,
+            port=port,
             baudrate=baud,
             timeout=SERIAL_TIMEOUT,
             write_timeout=2,
@@ -258,7 +283,9 @@ def test_modem(baud):
             if data:
                 response += data
                 if b"OK" in response.upper():
-                    log(f"Modem detected at {baud} baud.")
+                    # We have found the modem. Save the detected port.
+                    SERIAL_PORT = port
+                    log(f"Modem detected on {port} at {baud} baud.")
                     return True
 
             time.sleep(0.02)
@@ -269,25 +296,68 @@ def test_modem(baud):
             pass
 
         ser = None
+        current_baud = None
         return False
 
     except Exception as exc:
-        log(f"Could not open {SERIAL_PORT} at {baud}: {exc}")
+        log(f"Could not open {port} at {baud}: {exc}")
+
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
         ser = None
+        current_baud = None
         return False
 
 
 def find_modem():
-    list_com_ports()
+    """Scan all available Windows serial ports and detect the SIM800C."""
+    global SERIAL_PORT
 
-    available = [p.device for p in serial.tools.list_ports.comports()]
-    if SERIAL_PORT not in available:
-        log(f"WARNING: {SERIAL_PORT} is not currently listed.")
+    SERIAL_PORT = None
 
-    for baud in BAUD_RATES:
-        if test_modem(baud):
-            return True
+    ports = list(serial.tools.list_ports.comports())
 
+    log("")
+    log("Scanning for SIM800C modem...")
+    log("Available serial ports:")
+
+    if not ports:
+        log("  No COM ports detected.")
+        return False
+
+    # Show all detected ports first.
+    for port_info in ports:
+        log(
+            f"  {port_info.device} - "
+            f"{port_info.description or 'Unknown device'}"
+        )
+
+    log("")
+    log("Testing available COM ports...")
+
+    # Try every available COM port at every supported baud rate.
+    # This makes the script independent of the COM number assigned
+    # by Windows on a particular laptop/USB port.
+    for port_info in ports:
+        port = port_info.device
+
+        for baud in BAUD_RATES:
+            if test_modem(port, baud):
+                log("")
+                log("=" * 64)
+                log("SIM800C MODEM DETECTED")
+                log(f"Detected COM port : {SERIAL_PORT}")
+                log(f"Detected baud     : {current_baud}")
+                log("=" * 64)
+                log("")
+                return True
+
+    log("")
+    log("SIM800C was not detected on any available COM port.")
     return False
 
 
@@ -298,18 +368,15 @@ def find_modem():
 def configure_modem():
     log("Configuring SIM800C...")
 
+    # Core commands. SMS configuration is required for +CMTI notifications.
     commands = [
         ("ATE0", "OK", 2),
         ("AT+CLIP=1", "OK", 2),
         ("AT+CRC=1", "OK", 2),
-
-        # Audio-related modem settings.
-        # These configure the SIM800C audio path itself.
-        ("AT+CHFA=1", "OK", 2),
-        ("AT+CLVL=90", "OK", 2),
+        ("AT+CMGF=1", "OK", 2),
+        ("AT+CNMI=2,1,0,0,0", "OK", 2),
+        ("AT+CLVL=100", "OK", 2),
         ("AT+CMIC=0,12", "OK", 2),
-        ("AT+FMMUTE=0", "OK", 2),
-
         ("AT+CPIN?", "OK", 3),
         ("AT+CSQ", "OK", 3),
         ("AT+CREG?", "OK", 3),
@@ -319,17 +386,19 @@ def configure_modem():
     for command, expected, timeout in commands:
         ok = send_command(command, expected, timeout)
         if not ok:
-            log(f"Command did not return expected response: {command}")
+            log(f"WARNING: Command failed or timed out: {command}")
+
+    # These two commands are not required for basic calling/SMS operation.
+    # Your log shows ERROR for both on this firmware, so do not let them
+    # appear as fatal configuration errors.
+    log("Audio startup: AT+CHFA=1 and AT+FMMUTE=0 are intentionally not sent.")
+    log("Reason: your modem returned ERROR for both; they are not required for SMS/call control.")
 
     log("SIM800C configuration complete.")
-
-    # IMPORTANT:
-    # COM9 is the modem control/data interface. GSM voice audio is
-    # not delivered as PCM audio through this serial port.
     set_state(
-        audio="NOT AVAILABLE VIA COM9",
+        audio="NOT AVAILABLE VIA SERIAL PORT",
         audio_available=False,
-        last_event="Modem configured; waiting for incoming call.",
+        last_event="Modem configured; waiting for incoming calls/SMS.",
     )
 
 
@@ -343,41 +412,279 @@ def extract_caller_number(line):
 
 
 def answer_call():
+    """Answer the current incoming GSM voice call reliably.
+
+    IMPORTANT:
+    The serial-monitor thread is the owner of the incoming serial stream.
+    It holds command_lock while dispatching an unsolicited event, so this
+    function can safely take the same RLock and perform the ATA transaction
+    without another thread stealing the response.
+    """
     global last_answer_time
 
-    now = time.time()
+    with command_lock:
+        with state_lock:
+            current_status = state["status"]
+            caller = state.get("caller", "")
 
-    if now - last_answer_time < ANSWER_COOLDOWN_SEC:
-        log("ATA skipped: answer cooldown active.")
-        return False
+        if current_status in ("ANSWERING", "CONNECTED"):
+            log(">> ATA skipped: call is already being handled.")
+            return True
 
-    with state_lock:
-        if state["status"] in ("ANSWERING", "CONNECTED"):
-            log("ATA skipped: call is already being handled.")
+        # Do NOT use a fixed cooldown to suppress later RING/+CRING events.
+        # A failed ATA followed by another ring must be allowed to retry.
+        set_state(status="ANSWERING", last_event="Answering incoming call...")
+        log(">> AUTO ANSWER: Sending ATA...")
+        if caller:
+            log(f">> CALLER: {caller}")
+
+        # Give the modem a very small amount of time after the URC before ATA.
+        # This is intentionally short so the call is answered quickly.
+        if ANSWER_DELAY_SEC > 0:
+            time.sleep(ANSWER_DELAY_SEC)
+
+        # First attempt.
+        if not send_raw("ATA"):
+            set_state(status="IDLE", connected_at=None,
+                      last_event="Failed to send ATA.")
             return False
 
-    last_answer_time = now
+        deadline = time.time() + 5.0
+        buffer = ""
+        got_ok = False
+        got_connect = False
+        got_voice_begin = False
 
-    set_state(status="ANSWERING", last_event="Answering incoming call...")
-    log(">> AUTO ANSWER: Sending ATA...")
+        while time.time() < deadline:
+            try:
+                with serial_lock:
+                    waiting = ser.in_waiting if ser else 0
+                    data = ser.read(waiting) if waiting else b""
 
-    if not send_raw("ATA"):
+                if not data:
+                    time.sleep(0.01)
+                    continue
+
+                buffer += data.decode("utf-8", errors="replace")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    log(f"GSM> {line}")
+                    upper = line.upper()
+
+                    # Caller ID can arrive immediately before/after ATA.
+                    if upper.startswith("+CLIP:"):
+                        number = extract_caller_number(line)
+                        if number:
+                            set_state(caller=number,
+                                      last_event=f"Caller ID received: {number}")
+                        continue
+
+                    # Other unsolicited notifications are not ATA failures.
+                    if upper.startswith("+CMTI:"):
+                        # Do not recursively read another SMS while answering.
+                        log(">> SMS notification received during ATA; it will be handled after call processing.")
+                        continue
+
+                    if upper.startswith("+CRING:") or upper == "RING":
+                        log(">> Additional ring indication received while answering.")
+                        continue
+
+                    if upper in ("OK", "CONNECT"):
+                        got_ok = got_ok or upper == "OK"
+                        got_connect = got_connect or upper == "CONNECT"
+                    elif "VOICE CALL: BEGIN" in upper:
+                        got_voice_begin = True
+                    elif upper in ("NO CARRIER", "BUSY", "ERROR") or "+CME ERROR" in upper:
+                        log(f">> ATA failed: {line}")
+                        set_state(status="IDLE", connected_at=None,
+                                  last_event=f"Call answer failed: {line}")
+                        return False
+
+                    if got_ok or got_connect or got_voice_begin:
+                        last_answer_time = time.time()
+                        set_state(
+                            status="CONNECTED",
+                            connected_at=time.time(),
+                            last_event="Call connected.",
+                        )
+                        log(">> CALL ANSWERED SUCCESSFULLY")
+                        return True
+
+            except Exception as exc:
+                log(f"ATA response error: {exc}")
+                break
+
+        # ATA may occasionally succeed at the modem level but its OK/URC can
+        # be delayed. Verify the call state before declaring failure.
+        log(">> ATA response timeout; verifying call state with AT+CLCC...")
+
+        try:
+            if send_raw("AT+CLCC"):
+                verify_deadline = time.time() + 2.0
+                verify_buffer = ""
+                clcc_connected = False
+
+                while time.time() < verify_deadline:
+                    with serial_lock:
+                        waiting = ser.in_waiting if ser else 0
+                        data = ser.read(waiting) if waiting else b""
+
+                    if not data:
+                        time.sleep(0.01)
+                        continue
+
+                    verify_buffer += data.decode("utf-8", errors="replace")
+                    while "\n" in verify_buffer:
+                        line, verify_buffer = verify_buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        log(f"GSM> {line}")
+                        upper = line.upper()
+
+                        # +CLCC: <idx>,<dir>,<stat>,...
+                        if upper.startswith("+CLCC:"):
+                            parts = line.split(":", 1)[1].strip().split(",")
+                            if len(parts) >= 3:
+                                try:
+                                    # stat=0 means active call.
+                                    clcc_connected = int(parts[2].strip()) == 0
+                                except ValueError:
+                                    pass
+
+                        if upper == "OK":
+                            break
+
+                if clcc_connected:
+                    last_answer_time = time.time()
+                    set_state(
+                        status="CONNECTED",
+                        connected_at=time.time(),
+                        last_event="Call connected (verified by AT+CLCC).",
+                    )
+                    log(">> CALL ANSWERED SUCCESSFULLY (CLCC VERIFIED)")
+                    return True
+
+        except Exception as exc:
+            log(f">> AT+CLCC verification error: {exc}")
+
         set_state(
             status="IDLE",
-            last_event="Failed to send ATA.",
+            connected_at=None,
+            last_event="ATA timed out and no active call was detected.",
         )
+        log(">> WARNING: ATA did not produce a valid answer response.")
         return False
 
-    end_time = time.time() + 4.0
-    got_ok = False
-    got_connect = False
-    got_voice_begin = False
-    buffer = ""
+def hangup_call():
+    # The command lock is essential: otherwise the dashboard thread and
+    # serial-monitor thread can both read from the same COM port. That is
+    # exactly what caused your 'GSM> OK' followed by 'Hang-up response was not OK'.
+    with command_lock:
+        log(">> HANGING UP CALL...")
 
-    while time.time() < end_time:
-        try:
+        if not send_raw("ATH"):
+            set_state(status="IDLE", connected_at=None, caller="", last_event="Failed to send ATH.")
+            return False
+
+        deadline = time.time() + 4.0
+        buffer = ""
+
+        while time.time() < deadline:
+            try:
+                with serial_lock:
+                    waiting = ser.in_waiting if ser else 0
+                    data = ser.read(waiting) if waiting else b""
+
+                if not data:
+                    time.sleep(0.01)
+                    continue
+
+                buffer += data.decode("utf-8", errors="replace")
+
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    log(f"GSM> {line}")
+                    upper = line.upper()
+
+                    if upper == "OK":
+                        set_state(
+                            status="IDLE",
+                            connected_at=None,
+                            caller="",
+                            last_event="Call ended.",
+                        )
+                        log(">> CALL HUNG UP.")
+                        return True
+
+                    if upper == "NO CARRIER":
+                        set_state(
+                            status="IDLE",
+                            connected_at=None,
+                            caller="",
+                            last_event="Call ended by modem/network.",
+                        )
+                        log(">> CALL ENDED.")
+                        return True
+
+            except Exception as exc:
+                log(f"ATH response error: {exc}")
+                break
+
+        set_state(
+            status="IDLE",
+            connected_at=None,
+            caller="",
+            last_event="ATH timed out; call state reset.",
+        )
+        log(">> WARNING: No ATH response received within timeout.")
+        return False
+
+
+# ============================================================
+# SERIAL EVENT PROCESSING
+# ============================================================
+
+def extract_sms_fields_from_cmgr(header):
+    sender = ""
+    sms_time = ""
+    fields = re.findall(r'"([^"]*)"', header)
+    if len(fields) >= 2:
+        sender = fields[1]
+    if len(fields) >= 4:
+        sms_time = fields[3]
+    return sender, sms_time
+
+
+def read_sms(index):
+    """Read one stored SMS. Runs under command_lock so the serial reader cannot steal the response."""
+    with command_lock:
+        if not send_raw(f"AT+CMGR={index}"):
+            log("ERROR: Could not send AT+CMGR.")
+            return
+
+        deadline = time.time() + 4.0
+        buffer = ""
+        header_seen = False
+        sender = ""
+        sms_time = ""
+        body = []
+        response_done = False
+        saw_call = False
+
+        while time.time() < deadline and not response_done:
             with serial_lock:
-                waiting = ser.in_waiting
+                waiting = ser.in_waiting if ser else 0
                 data = ser.read(waiting) if waiting else b""
 
             if not data:
@@ -389,87 +696,92 @@ def answer_call():
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 line = line.strip()
-
                 if not line:
                     continue
 
                 log(f"GSM> {line}")
                 upper = line.upper()
 
+                if upper.startswith("+CMGR:"):
+                    header_seen = True
+                    sender, sms_time = extract_sms_fields_from_cmgr(line)
+                    continue
+
                 if upper == "OK":
-                    got_ok = True
+                    response_done = True
+                    break
 
-                elif upper == "CONNECT":
-                    got_connect = True
+                if upper == "ERROR":
+                    log(f"ERROR: AT+CMGR={index} failed.")
+                    return
 
-                elif "VOICE CALL: BEGIN" in upper:
-                    got_voice_begin = True
+                # If a URC arrives while reading SMS, handle it instead of
+                # accidentally appending it to the SMS body.
+                if upper.startswith("+CRING:") or upper == "RING":
+                    saw_call = True
+                    set_state(status="INCOMING", last_event="Incoming voice call detected while reading SMS.")
+                    continue
 
-                elif upper.startswith("+CLIP:"):
+                if upper.startswith("+CLIP:"):
                     number = extract_caller_number(line)
                     if number:
                         set_state(caller=number)
+                    continue
 
-                elif upper in ("NO CARRIER", "BUSY", "ERROR"):
-                    set_state(
-                        status="IDLE",
-                        connected_at=None,
-                        last_event=f"Call answer failed: {line}",
-                    )
-                    return False
+                if upper.startswith("+CMTI:"):
+                    handle_sms_notification(line)
+                    continue
 
-                if got_ok or got_connect or got_voice_begin:
-                    set_state(
-                        status="CONNECTED",
-                        connected_at=time.time(),
-                        last_event="Call connected.",
-                    )
+                if header_seen:
+                    body.append(line)
 
-                    log(">> CALL ANSWERED SUCCESSFULLY")
-                    return True
+            if header_seen and (body or buffer.strip() == ""):
+                # Continue briefly for final OK, but don't block for seconds.
+                pass
 
-        except Exception as exc:
-            log(f"ATA response error: {exc}")
-            break
+        message = "\n".join(body).strip()
 
-    if got_ok:
-        # SIM800-family modules can return OK before the unsolicited
-        # VOICE CALL: BEGIN notification.
         set_state(
-            status="CONNECTED",
-            connected_at=time.time(),
-            last_event="ATA accepted; call is active.",
+            last_sms_sender=sender,
+            last_sms_message=message,
+            last_sms_time=sms_time,
+            last_event=f"SMS received from {sender or 'Unknown'}",
         )
-        log(">> ATA returned OK; call marked active.")
-        return True
 
-    set_state(
-        status="IDLE",
-        connected_at=None,
-        last_event="ATA sent but no valid answer response received.",
-    )
-    return False
+        log("")
+        log("-" * 64)
+        log("SMS CONTENT")
+        log("-" * 64)
+        log(f"From    : {sender or 'Unknown'}")
+        log(f"Time    : {sms_time or 'Unknown'}")
+        log(f"Message : {message or '[EMPTY]'}")
+        log("-" * 64)
+        log("")
 
-
-def hangup_call():
-    log(">> HANGING UP CALL...")
-
-    ok = send_command("ATH", "OK", 3)
-
-    set_state(
-        status="IDLE",
-        connected_at=None,
-        caller="",
-        last_event="Call ended.",
-    )
-
-    log(">> CALL HUNG UP." if ok else ">> Hang-up response was not OK.")
-    return ok
+        if saw_call:
+            set_state(pending_call=True)
 
 
-# ============================================================
-# SERIAL EVENT PROCESSING
-# ============================================================
+def handle_sms_notification(line):
+    match = re.search(r'\+CMTI:\s*"([^"]+)"\s*,\s*(\d+)', line, re.IGNORECASE)
+    if not match:
+        log(f"WARNING: Could not parse SMS notification: {line}")
+        return
+
+    storage = match.group(1)
+    index = int(match.group(2))
+
+    log("")
+    log("=" * 64)
+    log("SMS RECEIVED")
+    log("=" * 64)
+    log(f"Storage : {storage}")
+    log(f"Index   : {index}")
+
+    # Read synchronously here, but with command_lock. The serial monitor is
+    # the only normal reader, so this avoids the previous response collision.
+    read_sms(index)
+
 
 def process_line(line):
     line = line.strip()
@@ -479,87 +791,54 @@ def process_line(line):
     upper = line.upper()
     log(f"GSM> {line}")
 
-    # -------------------- RING --------------------
+    if upper.startswith("+CMTI:"):
+        handle_sms_notification(line)
+        with state_lock:
+            pending = state.get("pending_call", False)
+            state["pending_call"] = False
+        if pending and AUTO_ANSWER:
+            answer_call()
+        return
 
-    if (
-        upper == "RING"
-        or upper.startswith("RING")
-        or upper.startswith("+CRING:")
-    ):
+    if upper == "RING" or upper.startswith("RING") or upper.startswith("+CRING:"):
         with state_lock:
             current_status = state["status"]
+            state["ring_count"] += 1
+            ring_count = state["ring_count"]
 
         if current_status in ("ANSWERING", "CONNECTED"):
             return
 
-        with state_lock:
-            state["ring_count"] += 1
-            ring_count = state["ring_count"]
-
-        set_state(
-            status="INCOMING",
-            last_event="Incoming voice call detected.",
-        )
-
+        set_state(status="INCOMING", last_event="Incoming voice call detected.")
         log(f">> INCOMING VOICE CALL DETECTED (ring {ring_count})")
 
         if AUTO_ANSWER:
             if ANSWER_DELAY_SEC > 0:
                 time.sleep(ANSWER_DELAY_SEC)
             answer_call()
-
         return
-
-    # -------------------- CALLER ID --------------------
 
     if upper.startswith("+CLIP:"):
         number = extract_caller_number(line)
-
         if number:
-            set_state(
-                caller=number,
-                last_event=f"Caller ID received: {number}",
-            )
+            set_state(caller=number, last_event=f"Caller ID received: {number}")
             log(f">> CALLER NUMBER: {number}")
-
         return
-
-    # -------------------- CONNECTED --------------------
 
     if upper == "CONNECT" or "VOICE CALL: BEGIN" in upper:
-        set_state(
-            status="CONNECTED",
-            connected_at=time.time(),
-            last_event="Voice call is active.",
-        )
-
+        set_state(status="CONNECTED", connected_at=time.time(), last_event="Voice call is active.")
         log(">> VOICE CALL IS ACTIVE")
         return
-
-    # -------------------- CALL ENDED --------------------
 
     if upper == "NO CARRIER":
         with state_lock:
             was_active = state["status"] in ("INCOMING", "ANSWERING", "CONNECTED")
-
         log(">> CALL ENDED" if was_active else ">> NO CARRIER")
-        set_state(
-            status="IDLE",
-            connected_at=None,
-            caller="",
-            last_event="Call ended by network/remote side.",
-        )
+        set_state(status="IDLE", connected_at=None, caller="", last_event="Call ended by network/remote side.")
         return
 
-    # -------------------- BUSY --------------------
-
     if upper == "BUSY":
-        set_state(
-            status="IDLE",
-            connected_at=None,
-            caller="",
-            last_event="Call status: BUSY.",
-        )
+        set_state(status="IDLE", connected_at=None, caller="", last_event="Call status: BUSY.")
         log(">> CALL STATUS: BUSY")
         return
 
@@ -569,51 +848,79 @@ def process_line(line):
 # ============================================================
 
 def serial_monitor():
+    """Single owner of the SIM800C unsolicited serial stream.
+
+    The critical reliability rule is that command_lock remains held while
+    received lines are dispatched.  This prevents the following race:
+
+        serial thread reads +CRING -> releases lock
+        serial thread reads +CLIP -> consumes it
+        answer_call() sends ATA -> waits for response
+
+    In that race the ATA/CLIP responses can be split between readers.
+    Keeping the lock through process_line() means answer_call() runs in the
+    same serialized transaction and no other thread can steal bytes.
+    """
     log("")
     log("=" * 64)
     log("SIM800C GSM RECEIVER + DASHBOARD")
     log("=" * 64)
-    log(f"Serial port : {SERIAL_PORT}")
+    log(f"Serial port : {SERIAL_PORT} (auto-detected)")
     log(f"Baud rate   : {current_baud}")
     log(f"Auto answer : {AUTO_ANSWER}")
     log(f"Dashboard   : http://{DASHBOARD_HOST}:{DASHBOARD_PORT}")
     log("")
-    log("Waiting for incoming calls...")
+    log("Waiting for incoming calls/SMS...")
     log("")
 
     partial = ""
 
     while not stop_event.is_set():
         try:
-            with serial_lock:
-                waiting = ser.in_waiting
-                data = ser.read(waiting) if waiting else b""
+            # Hold command_lock not only while reading bytes, but also while
+            # dispatching every complete line. Because command_lock is an
+            # RLock, answer_call()/read_sms()/hangup_call() can safely be
+            # called from this same thread.
+            with command_lock:
+                with serial_lock:
+                    waiting = ser.in_waiting if ser else 0
+                    data = ser.read(waiting) if waiting else b""
 
-            if data:
-                partial += data.decode("utf-8", errors="replace")
+                if data:
+                    partial += data.decode("utf-8", errors="replace")
 
-                while "\n" in partial:
-                    line, partial = partial.split("\n", 1)
-                    line = line.strip()
-                    if line:
-                        process_line(line)
+                    while "\n" in partial:
+                        line, partial = partial.split("\n", 1)
+                        line = line.strip()
+                        if line:
+                            process_line(line)
 
-            else:
+                # If an incoming call was detected while an SMS command was
+                # being processed, process it now while we still own the port.
+                with state_lock:
+                    pending = state.get("pending_call", False)
+                    current_status = state.get("status")
+                    if pending and current_status not in ("ANSWERING", "CONNECTED"):
+                        state["pending_call"] = False
+                    else:
+                        pending = False
+
+                if pending and AUTO_ANSWER:
+                    log(">> Processing pending incoming call after SMS transaction...")
+                    answer_call()
+
+                if HANGUP_AFTER_SEC > 0:
+                    current = get_state()
+                    if current["status"] == "CONNECTED" and current["duration"] >= HANGUP_AFTER_SEC:
+                        hangup_call()
+
+            if not data:
                 time.sleep(0.02)
-
-            if HANGUP_AFTER_SEC > 0:
-                current = get_state()
-                if (
-                    current["status"] == "CONNECTED"
-                    and current["duration"] >= HANGUP_AFTER_SEC
-                ):
-                    hangup_call()
 
         except serial.SerialException as exc:
             log(f"SERIAL ERROR: {exc}")
             stop_event.set()
             break
-
         except Exception as exc:
             log(f"SERIAL MONITOR ERROR: {exc}")
             time.sleep(0.2)
@@ -770,6 +1077,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <span id="duration" class="value">00:00</span>
         </div>
 
+        <div class="audio-box" style="margin-bottom:22px;">
+            <div><span class="label">Last SMS From</span> <span id="smsSender" class="value">--</span></div>
+            <div class="row"><span class="label">SMS Time</span> <span id="smsTime" class="value">--</span></div>
+            <div><span class="label">Message</span><div id="smsMessage" style="margin-top:10px;padding:12px;background:#111827;border-radius:8px;white-space:pre-wrap;word-break:break-word;">No SMS received yet.</div></div>
+        </div>
+
         <div class="audio-box">
             <div>
                 <span class="label">Audio</span>
@@ -786,9 +1099,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <div class="note">
             <b>Audio limitation:</b>
-            This RS2248/SIM800C USB COM9 connection provides the GSM
+            This RS2248/SIM800C USB serial connection provides the GSM
             control/serial interface. The GSM voice audio is not transferred
-            as PCM audio through COM9. Therefore this dashboard can display
+            as PCM audio through the serial port. Therefore this dashboard can display
             and control the call, but it cannot play the transmitter voice
             from COM9 alone.
         </div>
@@ -817,6 +1130,9 @@ function updateDashboard(data) {
     const event = document.getElementById('event');
     const hangup = document.getElementById('hangupButton');
     const mute = document.getElementById('muteButton');
+    const smsSender = document.getElementById('smsSender');
+    const smsTime = document.getElementById('smsTime');
+    const smsMessage = document.getElementById('smsMessage');
 
     status.textContent = data.status;
     status.className = 'status ' +
@@ -839,6 +1155,9 @@ function updateDashboard(data) {
 
     mute.disabled = !data.audio_available;
     mute.textContent = data.muted ? '🔊 UNMUTE' : '🔇 MUTE';
+    if (smsSender) smsSender.textContent = data.last_sms_sender || '--';
+    if (smsTime) smsTime.textContent = data.last_sms_time || '--';
+    if (smsMessage) smsMessage.textContent = data.last_sms_message || 'No SMS received yet.';
 }
 
 async function refresh() {
@@ -898,7 +1217,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browser refresh/close can terminate a keep-alive request while
+            # the server is writing. This is harmless and must not print a
+            # traceback into the console.
+            return
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -910,7 +1235,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
             return
 
         if path == "/api/status":
@@ -997,9 +1325,9 @@ def main():
 
     if not find_modem():
         log("")
-        log(f"ERROR: Could not detect SIM800C on {SERIAL_PORT}.")
-        log("Check USB connection and make sure PuTTY/another serial")
-        log("terminal is not using COM9.")
+        log("ERROR: Could not detect SIM800C on any available COM port.")
+        log("Check the USB connection, SIM800C power, driver, and cable.")
+        log("Also close PuTTY or any other program using the modem port.")
         return 1
 
     try:
