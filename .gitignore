@@ -1,3 +1,4 @@
 *.exe
 *.msi
-*.log
+*.log*.deb
+*.deb
