@@ -1,0 +1,43 @@
+------- ******* -------
+LINKS TO INSTALL THE REQUIRED SOFTWARE TOOLS
+------- ******* -------
+Link to install the VSCode on Linux - https://code.visualstudio.com/docs/setup/linux
+
+------- ******* -------
+STEPS TO INSTALL AND CHECK PYHTON
+------- ******* -------
+1. Install the Python on Linux
+    sudo apt update
+    sudo apt upgrade
+    sudo apt install python3.12 -y
+2. Check the python version installed on your Linux
+    python3 --version
+3. Plug in the GSM Receiver and check for the Serial Port
+    sudo apt install python3 python3-pip
+    python3 -m pip install pyserial
+    python3 -m serial.tools.list_ports
+    sudo usermod -aG dialout $USER
+
+-------l ******* -------
+STEPS TO CHECK THE FILE PERMISSIONS OF THE SCRIPT FILE
+------- ******** --------
+1. Run the below command to access the full read and write permissions of the script file
+   ls -l 
+   chmod +x gsm_receiver_dashboard_linux.py
+   ls -l 
+
+------- ******* -------
+STEPS TO CHECK THE CH341 DRIVER TO PROBE
+-------- ******* -------
+1. Check for the QinHeng Electronics CH340 serial converter
+    lsusb
+2. Check for the access of the Serial Port
+    ls -l /dev/ttyUSB*
+    ls -l /dev/ttyUSB0
+
+------- ******* -------
+STEP TO SETUP THE GSM RECEIVER
+------- ******* -------
+1. To run the script code type the following in your terminal
+    Navigate to the path of the downloaded script
+    python3 ./gsm_receiver_dashboard_linux.py

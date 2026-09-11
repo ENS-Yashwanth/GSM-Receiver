@@ -43,6 +43,7 @@ STEPS TO SETUP THE GSM RECEIVER
 4. Next install the required libraries for this project on VSCode by executing the command below
 	pip install -r requirements.txt
 		You should see the following message when the "PySerial" library is installed. This is the library that we will be using to communicate with the SIM800C USB to GSM module using the Serial protocol.
-5. To run the code snippet then type the following in your terminal
+5. To run the script code type the following in your terminal
+    Navigate to the path of the donwloaded script
 	cd ../../
-	py gsm_receiver.py
+	py ./gsm_receiveir_dashboard_windows.py
